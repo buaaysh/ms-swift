@@ -19,11 +19,21 @@ generation before introducing KV-cache reuse.
 import argparse
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 DEFAULT_SYSTEM = '你是驾驶助手，可以根据用户指令生成安全准确的回复。'
+DEFAULT_FORMAT_CONSTRAINT = (
+    '只输出一个横向标签和一个纵向标签，格式必须为'
+    '<LAT_LANE_CHANGE_LEFT>/<LAT_LANE_CHANGE_RIGHT>/<LAT_NUDGE_LEFT>/<LAT_NUDGE_RIGHT>/'
+    '<LAT_LANE_KEEP>/<LAT_INTERSECTION_FOLLOW>/<LAT_TURN_LEFT>/<LAT_TURN_RIGHT>/<LAT_U_TURN>'
+    '之一加上'
+    '<LON_MAINTAIN>/<LON_ACCELERATE>/<LON_DECELERATE>/<LON_STOP>'
+    '之一，最终格式为<...><...>，不要输出任何解释、标点或换行。'
+)
+LABEL_PATTERN = re.compile(r'(<LAT_[A-Z_]+>)\s*(<LON_[A-Z_]+>)')
 
 
 def _json_dumps(obj: Dict[str, Any]) -> str:
@@ -90,6 +100,21 @@ def _build_messages(user_text: str, system: Optional[str]) -> List[Dict[str, str
         messages.append({'role': 'system', 'content': system})
     messages.append({'role': 'user', 'content': user_text})
     return messages
+
+
+def _prepare_user_text(user_text: str, force_label_format: bool, format_constraint: str) -> str:
+    if not force_label_format:
+        return user_text
+    return f'{user_text}\n\n{format_constraint}'
+
+
+def _normalize_label_pred(pred: Optional[str]) -> Tuple[Optional[str], bool]:
+    if not pred:
+        return None, False
+    match = LABEL_PATTERN.search(pred)
+    if not match:
+        return None, False
+    return f'{match.group(1)}{match.group(2)}', True
 
 
 def _select_step_frames(record: Dict[str, Any], step: Dict[str, Any], recompute: bool) -> List[str]:
@@ -183,9 +208,11 @@ def run(args: argparse.Namespace) -> None:
             for step in _iter_steps(record, args.max_steps):
                 frames = _select_step_frames(record, step, recompute=args.recompute)
                 frames = _rewrite_frames(frames, prefix_map)
-                user_text = step['user_text']
+                user_text = _prepare_user_text(
+                    step['user_text'], force_label_format=args.force_label_format, format_constraint=args.format_constraint)
                 messages = _build_messages(user_text, system)
                 pred = None if args.dry_run else _infer_one_step(engine, messages, frames, args)
+                normalized_pred, pred_valid_format = _normalize_label_pred(pred)
                 row = {
                     'scene_idx': scene_idx,
                     'scene_id': scene_id,
@@ -196,6 +223,8 @@ def run(args: argparse.Namespace) -> None:
                     'mode': 'recompute' if args.recompute else 'chunk',
                     'dry_run': args.dry_run,
                     'pred': pred,
+                    'normalized_pred': normalized_pred,
+                    'pred_valid_format': pred_valid_format,
                     'expected_assistant': step.get('expected_assistant'),
                 }
                 line = _json_dumps(row)
@@ -232,6 +261,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--top-k', type=int, default=None)
     parser.add_argument('--repetition-penalty', type=float, default=None)
     parser.add_argument('--stop', action='append', default=[])
+    parser.add_argument('--force-label-format', action='store_true',
+                        help='Append a strict output-format instruction for <LAT_...><LON_...>.')
+    parser.add_argument('--format-constraint', default=DEFAULT_FORMAT_CONSTRAINT,
+                        help='Custom format instruction appended when --force-label-format is enabled.')
 
     parser.add_argument('--recompute', action=argparse.BooleanOptionalAction, default=True,
                         help='Use cumulative frames videos[0][:prefix_end]. Disable to send only step["frames"].')
